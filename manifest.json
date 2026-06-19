@@ -1,0 +1,1 @@
+{"manifest_version":4,"type":"extension","name":"qq_export","slug":"qq_export","description":"qq_export","version":"1.0.0","icon":"./assets/icon.svg","authors":[{"name":"mkzi-nya","link":"https://github.com/mkzi-nya/qq_export/"}],"platform":["darwin"],"injects":{"main":"./main/main.cjs","preload":"./preload/preload.cjs","renderer":"./renderer/index.js"}}
