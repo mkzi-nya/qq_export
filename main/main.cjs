@@ -16,12 +16,16 @@ const os = require('node:os');
 const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
+const readline = require('node:readline');
 const { URL } = require('node:url');
 const electron = require('electron');
 
 const PLUGIN_NAME = 'qq_export';
-const VERSION = '1.0.0';
-const DEFAULT_PORT = 18765;
+const VERSION = '1.1.1';
+const DEFAULT_PORT = Math.max(1, Number(process.env.QQ_EXPORT_PORT || 18765));
+const LISTEN_HOST = String(process.env.QQ_EXPORT_HOST || '127.0.0.1');
+const DEFAULT_INCREMENTAL_OVERLAP_MS = Math.max(0, Number(process.env.QQ_EXPORT_INCREMENTAL_OVERLAP_MS || 10 * 60 * 1000));
+const DEFAULT_INCREMENTAL_OVERLAP_SEQ = Math.max(0, Number(process.env.QQ_EXPORT_INCREMENTAL_OVERLAP_SEQ || 2000));
 const MAX_MESSAGES_PER_CHUNK = 50000;
 const MAX_BYTES_PER_CHUNK = 50 * 1024 * 1024;
 const QCE_APP_NAME = 'qq_export / https://github.com/mkzi-nya/qq_export/';
@@ -1071,7 +1075,12 @@ function normalizeMessage(raw, peer) {
 
 function filterByOptions(raw, opts) {
   const ts = getRawMsgTimestamp(raw);
-  if (opts.fromMs && ts < opts.fromMs) return false;
+  const seq = getRawMsgSeq(raw);
+  if (opts.incremental && (opts.fromMs || opts.fromSeq)) {
+    const inTimeOverlap = !!opts.fromMs && ts >= opts.fromMs;
+    const inSeqOverlap = !!opts.fromSeq && seq >= opts.fromSeq;
+    if (!inTimeOverlap && !inSeqOverlap) return false;
+  } else if (opts.fromMs && ts < opts.fromMs) return false;
   if (opts.toMs && ts > opts.toMs) return false;
   const system = isRawSystem(raw);
   const recalled = isRawRecalled(raw);
@@ -1119,6 +1128,15 @@ async function fetchBySeq(peer, seq, count, task, includeRecalled, retries = 5, 
   }
 }
 
+function crossedLowerBoundary(messages, opts) {
+  if (!Array.isArray(messages) || !messages.length) return false;
+  const tr = msgTimeRange(messages);
+  const sr = msgSeqRange(messages);
+  const timeCrossed = !opts.fromMs || (!!tr.min && tr.min < opts.fromMs);
+  const seqCrossed = !opts.fromSeq || (!!sr.min && sr.min < opts.fromSeq);
+  return timeCrossed && seqCrossed;
+}
+
 async function fetchSequential(peer, opts, task) {
   const out = [];
   const started = Date.now();
@@ -1134,8 +1152,12 @@ async function fetchSequential(peer, opts, task) {
   pushTaskLog(task, `顺序页 #1：raw=${latest.length} accepted=${accepted} cursor=${cursor} total=${out.length}`);
   let pages = 1;
   while (!task.stopRequested) {
-    const minTime = msgTimeRange(latest).min;
-    if (opts.fromMs && out.length && minTime && minTime < opts.fromMs) { pushTaskLog(task, `顺序停止：已越过开始时间 minPageTime=${new Date(minTime).toISOString()}`); break; }
+    if ((opts.fromMs || opts.fromSeq) && crossedLowerBoundary(latest, opts)) {
+      const minTime = msgTimeRange(latest).min;
+      const minSeq = msgSeqRange(latest).min;
+      pushTaskLog(task, `顺序停止：已越过增量重叠边界 minPageTime=${minTime ? new Date(minTime).toISOString() : '-'} minPageSeq=${minSeq || '-'}`);
+      break;
+    }
     if (!cursor || cursor <= 1) { pushTaskLog(task, `顺序停止：游标到边界 cursor=${cursor}`); break; }
     const requestSeq = cursor - 1;
     const batch = await fetchBySeq(peer, requestSeq, Number(opts.batchCount || 200), task, opts.includeRecalled, Number(opts.historyRetryCount || 5), { page: pages + 1 });
@@ -1152,11 +1174,12 @@ async function fetchSequential(peer, opts, task) {
   return out;
 }
 
-function makeWindows(maxSeq, windowSize) {
+function makeWindows(maxSeq, windowSize, minSeq = 1) {
   const wins = [];
   let hi = maxSeq;
-  while (hi > 0) {
-    const lo = Math.max(1, hi - windowSize + 1);
+  const floor = Math.max(1, Number(minSeq || 1));
+  while (hi >= floor) {
+    const lo = Math.max(floor, hi - windowSize + 1);
     wins.push({ lo, hi });
     hi = lo - 1;
   }
@@ -1205,10 +1228,11 @@ async function fetchWindow(peer, win, opts, task, workerId = 0) {
       pushTaskLog(task, `[W${workerId}] 窗口页 #${pages} ${rangeLabel(win)} raw=${batch.length} seq=${minSeq}-${maxSeq} inWindow=${inWin.length} accepted=${accepted} cursor ${cursor}->${nextCursor} total=${out.length}`);
       cursor = nextCursor;
     }
-    if (opts.fromMs && inWin.length) {
-      const times = inWin.map(getRawMsgTimestamp).filter(Boolean);
-      const minTs = times.length ? minMaxNumbers(times).min : 0;
-      if (minTs && minTs < opts.fromMs) { reason = `达到开始时间 ${new Date(minTs).toISOString()}`; break; }
+    if ((opts.fromMs || opts.fromSeq) && inWin.length && crossedLowerBoundary(inWin, opts)) {
+      const minTs = msgTimeRange(inWin).min;
+      const minSeq = msgSeqRange(inWin).min;
+      reason = `达到增量重叠边界 time=${minTs ? new Date(minTs).toISOString() : '-'} seq=${minSeq || '-'}`;
+      break;
     }
   }
   if (task.stopRequested) reason = '提前停止';
@@ -1226,7 +1250,7 @@ async function fetchParallel(peer, opts, task) {
   }
   const firstAccepted = first.filter(m => filterByOptions(m, opts));
   const windowSize = Number(opts.seqWindow || 0) || Math.max(25000, Math.ceil(maxSeq / 24));
-  const windows = makeWindows(maxSeq, windowSize);
+  const windows = makeWindows(maxSeq, windowSize, opts.fromSeq || 1);
   const workers = Math.max(1, Math.min(4, Number(opts.historyWorkers || 2)));
   const results = [...firstAccepted];
   const failed = [];
@@ -1296,6 +1320,223 @@ function dedupeAndSort(rawMessages) {
 }
 
 
+function normalizedSeqRange(messages) {
+  return minMaxNumbers((messages || []).map(m => Number(m?.seq || 0)));
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (!value || typeof value !== 'object') return JSON.stringify(value);
+  return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`;
+}
+
+function normalizedMessageIdentityKeys(msg) {
+  const keys = [];
+  const id = String(msg?.id || '').trim();
+  const seq = String(msg?.seq || '').trim();
+  const timestamp = Number(msg?.timestamp || 0) || 0;
+  const sender = msg?.sender || {};
+  const senderId = String(sender.uin || sender.uid || sender.id || 'unknown');
+  const type = String(msg?.type || 'unknown');
+  const content = msg?.content || {};
+  const contentShape = {
+    text: String(content.text || ''),
+    elements: Array.isArray(content.elements) ? content.elements : [],
+    resources: Array.isArray(content.resources) ? content.resources.map(r => ({
+      type: r?.type || '', md5: r?.md5 || r?.fileMd5 || '', key: r?.key || '',
+      name: r?.filename || r?.name || '', size: r?.size || r?.fileSize || 0
+    })) : []
+  };
+  const contentHash = crypto.createHash('sha1').update(canonicalJson(contentShape)).digest('hex');
+  if (id) keys.push(`id:${id}`);
+  if (seq) keys.push(`seq:${seq}|sender:${senderId}|type:${type}|hash:${contentHash}`);
+  else keys.push(`fp:${timestamp}|sender:${senderId}|type:${type}|hash:${contentHash}`);
+  return keys;
+}
+
+function messageRichnessScore(msg) {
+  const sender = msg?.sender || {};
+  const content = msg?.content || {};
+  return (
+    String(content.text || '').length +
+    (Array.isArray(content.elements) ? content.elements.length * 20 : 0) +
+    (Array.isArray(content.resources) ? content.resources.length * 50 : 0) +
+    Object.values(sender).filter(Boolean).length * 5
+  );
+}
+
+function mergeNormalizedMessages(...messageLists) {
+  const merged = [];
+  const keyToIndex = new Map();
+  for (const list of messageLists) {
+    for (const msg of list || []) {
+      if (!msg || typeof msg !== 'object') continue;
+      const keys = normalizedMessageIdentityKeys(msg);
+      let index = -1;
+      for (const key of keys) {
+        if (keyToIndex.has(key)) { index = keyToIndex.get(key); break; }
+      }
+      if (index < 0) {
+        index = merged.length;
+        merged.push(msg);
+      } else if (messageRichnessScore(msg) > messageRichnessScore(merged[index])) {
+        merged[index] = msg;
+      }
+      for (const key of normalizedMessageIdentityKeys(merged[index])) keyToIndex.set(key, index);
+      for (const key of keys) keyToIndex.set(key, index);
+    }
+  }
+  return merged.sort((a, b) => {
+    const ta = Number(a?.timestamp || 0), tb = Number(b?.timestamp || 0);
+    if (ta !== tb) return ta - tb;
+    const sa = Number(a?.seq || 0), sb = Number(b?.seq || 0);
+    if (sa !== sb) return sa - sb;
+    return String(a?.id || '').localeCompare(String(b?.id || ''));
+  });
+}
+
+async function readJsonlFile(file) {
+  const out = [];
+  const input = fs.createReadStream(file, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input, crlfDelay: Infinity });
+  for await (const line of rl) {
+    const text = line.trim();
+    if (!text) continue;
+    try { out.push(JSON.parse(text)); }
+    catch (err) { throw new Error(`JSONL 解析失败 ${file}: ${err.message}`); }
+  }
+  return out;
+}
+
+async function loadMessagesFromOutputDir(outDir) {
+  if (!outDir) return [];
+  const manifestFile = path.join(outDir, 'manifest.json');
+  if (fs.existsSync(manifestFile)) {
+    const manifest = JSON.parse(await fsp.readFile(manifestFile, 'utf8'));
+    const chunks = manifest?.chunked?.chunks || [];
+    const all = [];
+    for (const chunk of chunks) {
+      const rel = chunk.relativePath || path.join(manifest.chunked?.chunksDir || 'chunks', chunk.fileName || '');
+      const file = path.resolve(outDir, rel);
+      if (!file.startsWith(path.resolve(outDir) + path.sep) && file !== path.resolve(outDir)) throw new Error(`非法 chunk 路径: ${rel}`);
+      if (!fs.existsSync(file)) continue;
+      all.push(...await readJsonlFile(file));
+    }
+    return all;
+  }
+  const jsonFile = path.join(outDir, 'export.json');
+  if (fs.existsSync(jsonFile)) {
+    const obj = JSON.parse(await fsp.readFile(jsonFile, 'utf8'));
+    return Array.isArray(obj?.messages) ? obj.messages : [];
+  }
+  const directJsonl = path.join(outDir, 'history.jsonl');
+  if (fs.existsSync(directJsonl)) return readJsonlFile(directJsonl);
+  return [];
+}
+
+async function streamMessagesFromOutputDir(outDir, res) {
+  const manifestFile = path.join(outDir, 'manifest.json');
+  res.writeHead(200, {
+    'content-type': 'application/x-ndjson; charset=utf-8',
+    'access-control-allow-origin': '*',
+    'cache-control': 'no-store'
+  });
+  if (fs.existsSync(manifestFile)) {
+    const manifest = JSON.parse(await fsp.readFile(manifestFile, 'utf8'));
+    for (const chunk of manifest?.chunked?.chunks || []) {
+      const rel = chunk.relativePath || path.join(manifest.chunked?.chunksDir || 'chunks', chunk.fileName || '');
+      const file = path.resolve(outDir, rel);
+      if (!file.startsWith(path.resolve(outDir) + path.sep) && file !== path.resolve(outDir)) throw new Error(`非法 chunk 路径: ${rel}`);
+      if (!fs.existsSync(file)) continue;
+      await new Promise((resolve, reject) => {
+        const input = fs.createReadStream(file);
+        input.on('error', reject);
+        input.on('end', resolve);
+        input.pipe(res, { end: false });
+      });
+    }
+    return res.end();
+  }
+  const messages = await loadMessagesFromOutputDir(outDir);
+  for (const msg of messages) await writeLine(res, JSON.stringify(msg, jsonReplacer) + '\n');
+  res.end();
+}
+
+function resolveOutputRelativeFile(outDir, relativePath) {
+  const rel = String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!rel || rel.includes('\0')) throw new Error('缺少输出文件路径');
+  const root = path.resolve(outDir);
+  const file = path.resolve(root, rel);
+  if (file !== root && !file.startsWith(root + path.sep)) throw new Error(`非法输出文件路径: ${relativePath}`);
+  return { rel, file };
+}
+
+async function readChunkedOutputDescriptor(outDir) {
+  const manifestPath = path.join(outDir, 'manifest.json');
+  if (!fs.existsSync(manifestPath)) throw new Error('该导出结果不是分块 JSONL，缺少 manifest.json');
+  const manifest = JSON.parse(await fsp.readFile(manifestPath, 'utf8'));
+  const files = [];
+  const declared = new Set(['manifest.json']);
+  for (const chunk of manifest?.chunked?.chunks || []) {
+    const rel = String(chunk.relativePath || path.join(manifest.chunked?.chunksDir || 'chunks', chunk.fileName || '')).replace(/\\/g, '/');
+    const { file } = resolveOutputRelativeFile(outDir, rel);
+    if (!fs.existsSync(file)) throw new Error(`manifest 声明的 chunk 不存在: ${rel}`);
+    const stat = await fsp.stat(file);
+    declared.add(rel);
+    files.push({
+      index: Number(chunk.index || files.length + 1),
+      fileName: chunk.fileName || path.basename(rel),
+      relativePath: rel,
+      count: Number(chunk.count || 0),
+      bytes: stat.size,
+      start: chunk.start || '',
+      end: chunk.end || ''
+    });
+  }
+  return { manifest, files, declared };
+}
+
+function contentTypeForOutputFile(file) {
+  if (file.endsWith('.jsonl')) return 'application/x-ndjson; charset=utf-8';
+  if (file.endsWith('.json')) return 'application/json; charset=utf-8';
+  return 'application/octet-stream';
+}
+
+async function streamDeclaredOutputFile(record, relativePath, res) {
+  const descriptor = await readChunkedOutputDescriptor(record.outputDir);
+  const { rel, file } = resolveOutputRelativeFile(record.outputDir, relativePath);
+  if (!descriptor.declared.has(rel)) throw new Error(`文件不在 manifest 声明中: ${rel}`);
+  const stat = await fsp.stat(file);
+  res.writeHead(200, {
+    'content-type': contentTypeForOutputFile(file),
+    'content-length': stat.size,
+    'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(file))}`,
+    'access-control-allow-origin': '*',
+    'cache-control': 'no-store'
+  });
+  await new Promise((resolve, reject) => {
+    const input = fs.createReadStream(file);
+    input.on('error', reject);
+    input.on('end', resolve);
+    input.pipe(res);
+  });
+}
+
+async function sendChunkedOutputManifest(record, res) {
+  const descriptor = await readChunkedOutputDescriptor(record.outputDir);
+  return sendJson(res, {
+    ok: true,
+    id: record.id || '',
+    sessionType: record.sessionType || record.peer?.typeName || '',
+    sessionId: String(record.sessionId || record.peer?.uin || record.peer?.peerUid || ''),
+    sessionName: record.sessionName || record.peer?.name || '',
+    format: 'chunked-jsonl',
+    manifest: descriptor.manifest,
+    files: descriptor.files
+  });
+}
+
+
 function computeStats(messages) {
   const st = createStatsTracker();
   for (const m of messages) updateStatsTracker(st, m);
@@ -1306,7 +1547,10 @@ function makeChatInfo(peer, messagesOrCount) {
   const self = getSelfInfo();
   const result = {
     name: peer.name,
-    type: peer.typeName
+    type: peer.typeName,
+    id: String(peer.uin || peer.peerUid || ''),
+    uin: String(peer.uin || ''),
+    uid: String(peer.peerUid || '')
   };
   if (self.uid) result.selfUid = self.uid;
   if (self.uin) result.selfUin = self.uin;
@@ -1607,6 +1851,7 @@ async function writeChunkedJsonlFromRaw(outDir, peer, rawMessages, task = null) 
 
 async function writeChunkedJsonlStream(outDir, peer, sourceMessages, task = null, options = {}) {
   const chunksDir = path.join(outDir, 'chunks');
+  await fsp.rm(chunksDir, { recursive: true, force: true });
   ensureDir(chunksDir);
   const chunks = [];
   let chunkIndex = 0;
@@ -1730,10 +1975,17 @@ function registerExportHistory(record) {
 
 function parseTimeRange(opts, baseHistory) {
   const range = opts.timePreset || 'all';
-  let fromMs = 0, toMs = 0;
+  let fromMs = 0, toMs = 0, fromSeq = 0;
   const now = nowMs();
-  if (opts.incremental && (baseHistory?.latestTimestamp || opts.incrementalStartTimestamp)) {
-    fromMs = Number(baseHistory?.latestTimestamp || opts.incrementalStartTimestamp) + 1;
+  if (opts.incremental && (baseHistory?.latestTimestamp || opts.incrementalStartTimestamp || baseHistory?.latestSeq || opts.incrementalStartSeq)) {
+    const latestTimestamp = Number(baseHistory?.latestTimestamp || opts.incrementalStartTimestamp || 0) || 0;
+    const latestSeq = Number(baseHistory?.latestSeq || opts.incrementalStartSeq || 0) || 0;
+    const overlapMs = Math.max(0, Number(opts.incrementalOverlapMs ?? DEFAULT_INCREMENTAL_OVERLAP_MS));
+    const overlapSeq = Math.max(0, Number(opts.incrementalOverlapSeq ?? DEFAULT_INCREMENTAL_OVERLAP_SEQ));
+    // Deliberately overlap the previous export. Using latestTimestamp + 1 can lose
+    // messages that share a timestamp or arrive late; overlap + merge is idempotent.
+    if (latestTimestamp) fromMs = Math.max(0, latestTimestamp - overlapMs);
+    if (latestSeq) fromSeq = Math.max(1, latestSeq - overlapSeq);
   } else if (range === '1d') fromMs = now - 86400000;
   else if (range === '1w') fromMs = now - 7 * 86400000;
   else if (range === '1m') fromMs = now - 30 * 86400000;
@@ -1742,7 +1994,33 @@ function parseTimeRange(opts, baseHistory) {
     if (opts.from) fromMs = new Date(opts.from).getTime();
     if (opts.to) toMs = new Date(opts.to).getTime();
   }
-  return { fromMs: Number.isFinite(fromMs) ? fromMs : 0, toMs: Number.isFinite(toMs) ? toMs : 0 };
+  return {
+    fromMs: Number.isFinite(fromMs) ? fromMs : 0,
+    toMs: Number.isFinite(toMs) ? toMs : 0,
+    fromSeq: Number.isFinite(fromSeq) ? fromSeq : 0
+  };
+}
+
+function canonicalSessionType(value) {
+  return String(value || '').toLowerCase() === 'group' ? 'group' : 'private';
+}
+
+function historySessionId(h) {
+  const peer = h?.peer || {};
+  return String(h?.sessionId || peer.uin || peer.peerUid || peer.uid || '');
+}
+
+function sameConversationRecord(h, peer) {
+  if (!h || !peer) return false;
+  const ht = canonicalSessionType(h.sessionType || h.peer?.typeName);
+  const pt = canonicalSessionType(peer.typeName);
+  return ht === pt && historySessionId(h) === String(peer.uin || peer.peerUid || '');
+}
+
+function findLatestHistoryForPeer(history, peer) {
+  return history
+    .filter(h => sameConversationRecord(h, peer) && h.outputDir && fs.existsSync(h.outputDir))
+    .sort((a, b) => String(b.completedAt || b.createdAt || '').localeCompare(String(a.completedAt || a.createdAt || '')))[0] || null;
 }
 
 function cleanupAfterExport(task) {
@@ -1757,30 +2035,45 @@ async function runExport(task) {
   try {
     updateTask(task, { status: 'running', message: '准备导出', progress: 1 });
     const opts = task.options;
+    const peer = await resolvePeer(opts);
+    task.peer = peer;
     const history = loadHistory();
-    const baseHistory = opts.incrementalBaseId ? history.find(h => h.id === opts.incrementalBaseId) : null;
+    let baseHistory = opts.incrementalBaseId ? history.find(h => h.id === opts.incrementalBaseId) : null;
+    if (opts.incremental && !baseHistory) baseHistory = findLatestHistoryForPeer(history, peer);
+    if (baseHistory && !sameConversationRecord(baseHistory, peer)) throw new Error('增量基准与目标会话不一致');
     const range = parseTimeRange(opts, baseHistory);
     opts.fromMs = range.fromMs;
     opts.toMs = range.toMs;
-    const peer = await resolvePeer(opts);
-    task.peer = peer;
+    opts.fromSeq = range.fromSeq;
     const stamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
-    const dirName = `${peer.typeName}_${safeName(peer.name)}_${safeName(peer.uin || peer.peerUid)}_${stamp}${opts.incremental ? '_incremental' : ''}`;
-    const outDir = opts.outputDir ? path.join(opts.outputDir, dirName) : path.join(state.exportsDir, dirName);
+    const suffix = opts.incremental ? '_incremental_merged' : '';
+    const dirName = `${peer.typeName}_${safeName(peer.name)}_${safeName(peer.uin || peer.peerUid)}_${stamp}${suffix}`;
+    const outDir = opts.exactOutputDir || (opts.outputDir ? path.join(opts.outputDir, dirName) : path.join(state.exportsDir, dirName));
     ensureDir(outDir);
     task.outputDir = outDir;
     pushTaskLog(task, `输出目录：${outDir}`);
-    pushTaskLog(task, `任务参数：session=${peer.typeName}/${peer.name}/${peer.uin || peer.peerUid} format=${opts.format} time=${range.fromMs ? new Date(range.fromMs).toISOString() : 'all'}..${range.toMs ? new Date(range.toMs).toISOString() : 'now'} batch=${opts.batchCount} retry=${opts.historyRetryCount} parallel=${!!opts.parallelHistory} workers=${opts.historyWorkers} seqWindow=${opts.seqWindow} resources=${!!opts.exportResources}`);
-    pushTaskLog(task, opts.parallelHistory ? '直接 QQNT IPC 并行拉取历史' : '直接 QQNT IPC 顺序拉取历史');
+    pushTaskLog(task, `任务参数：session=${peer.typeName}/${peer.name}/${peer.uin || peer.peerUid} format=${opts.format} time=${range.fromMs ? new Date(range.fromMs).toISOString() : 'all'}..${range.toMs ? new Date(range.toMs).toISOString() : 'now'} seqFrom=${range.fromSeq || '-'} batch=${opts.batchCount} retry=${opts.historyRetryCount} parallel=${!!opts.parallelHistory} workers=${opts.historyWorkers} seqWindow=${opts.seqWindow} resources=${!!opts.exportResources}`);
+    if (baseHistory) pushTaskLog(task, `增量基准：${baseHistory.id} ${baseHistory.outputDir}；将读取重叠区并与旧记录去重合并`);
+    const useParallel = !!opts.parallelHistory && !opts.incremental;
+    pushTaskLog(task, useParallel ? '直接 QQNT IPC 并行拉取历史' : '直接 QQNT IPC 顺序拉取历史');
     updateTask(task, { message: '读取历史消息', progress: 5 });
 
-    const raw = opts.parallelHistory ? await fetchParallel(peer, opts, task) : await fetchSequential(peer, opts, task);
+    const raw = useParallel ? await fetchParallel(peer, opts, task) : await fetchSequential(peer, opts, task);
     let sortedRaw = dedupeAndSort(raw);
     if (opts.maxMessages && sortedRaw.length > opts.maxMessages) sortedRaw = sortedRaw.slice(-opts.maxMessages);
     const duplicateCount = raw.length - sortedRaw.length;
     const seqRangeAfter = msgSeqRange(sortedRaw);
     pushTaskLog(task, `历史读取完成：原始 ${raw.length} 条，去重后 ${sortedRaw.length} 条，重复 ${duplicateCount} 条，seqRange=${seqRangeAfter.min ? seqRangeAfter.min + '-' + seqRangeAfter.max : '-'}`);
-    updateTask(task, { progress: 75, message: '写入 JSON/JSONL', messageCount: sortedRaw.length });
+    updateTask(task, { progress: 75, message: '合并并写入 JSON/JSONL', messageCount: sortedRaw.length });
+
+    const newMessages = sortedRaw.map(m => normalizeMessage(m, peer));
+    let messages = newMessages;
+    let baseMessages = [];
+    if (opts.incremental && opts.autoMergeIncremental && baseHistory?.outputDir) {
+      baseMessages = await loadMessagesFromOutputDir(baseHistory.outputDir);
+      messages = mergeNormalizedMessages(baseMessages, newMessages);
+      pushTaskLog(task, `增量合并：基准=${baseMessages.length} 新抓取=${newMessages.length} 合并后=${messages.length} 去重=${baseMessages.length + newMessages.length - messages.length}`);
+    }
 
     const outputs = [];
     let stats = null;
@@ -1788,18 +2081,13 @@ async function runExport(task) {
     let resourcesForExport = [];
 
     if (opts.format === 'jsonl') {
-      pushTaskLog(task, '已选择 JSONL：直接从 raw 消息流式归一化并写入 chunk，不构造完整 messages/exportData 大对象');
-      const jsonl = await writeChunkedJsonlFromRaw(outDir, peer, sortedRaw, task);
+      const jsonl = await writeChunkedJsonlFromMessages(outDir, peer, messages, task);
       outputs.push(jsonl.file);
       stats = jsonl.stats;
       messageCount = jsonl.messageCount;
       resourcesForExport = jsonl.resources;
     } else {
-      pushTaskLog(task, `开始归一化消息：${sortedRaw.length} 条（format=${opts.format} 需要完整 messages 数组）`);
-      const messages = sortedRaw.map(m => normalizeMessage(m, peer));
-      const typeStats = messages.reduce((m, x) => { m[x.type || 'unknown'] = (m[x.type || 'unknown'] || 0) + 1; return m; }, {});
-      pushTaskLog(task, `归一化完成：typeStats=${JSON.stringify(typeStats)}`);
-      if (opts.format === 'json') outputs.push(await writeSingleJson(outDir, peer, messages, opts, task));
+      outputs.push(await writeSingleJson(outDir, peer, messages, opts, task));
       stats = computeStats(messages);
       messageCount = messages.length;
       resourcesForExport = summarizeResourcesFromMessages(messages, opts);
@@ -1810,6 +2098,7 @@ async function runExport(task) {
       await exportResourcesFromCandidates(resourcesForExport, outDir, task, opts.resourceWorkers || 3);
     }
 
+    const seqStats = normalizedSeqRange(messages);
     const record = {
       id: task.id,
       createdAt: task.createdAt,
@@ -1820,6 +2109,11 @@ async function runExport(task) {
       messageCount,
       latestTimestamp: stats.timeRange.end ? new Date(stats.timeRange.end).getTime() : 0,
       earliestTimestamp: stats.timeRange.start ? new Date(stats.timeRange.start).getTime() : 0,
+      latestSeq: seqStats.max,
+      earliestSeq: seqStats.min,
+      baseHistoryId: baseHistory?.id || null,
+      mergedBaseCount: baseMessages.length,
+      fetchedCount: newMessages.length,
       stoppedEarly: !!task.stopRequested,
       incompleteWindows: task.incompleteWindows,
       outputs,
@@ -1876,7 +2170,12 @@ function normalizeExportOptions(input = {}) {
     incremental: !!(input.incremental || input.timeMode === 'incremental'),
     incrementalBaseId: input.incrementalBaseId || input.incrementalOf || null,
     incrementalStartTimestamp: Number(input.incrementalStartTimestamp || 0) || 0,
+    incrementalStartSeq: Number(input.incrementalStartSeq || 0) || 0,
+    incrementalOverlapMs: Math.max(0, Number(input.incrementalOverlapMs ?? DEFAULT_INCREMENTAL_OVERLAP_MS)),
+    incrementalOverlapSeq: Math.max(0, Number(input.incrementalOverlapSeq ?? DEFAULT_INCREMENTAL_OVERLAP_SEQ)),
+    autoMergeIncremental: input.autoMergeIncremental ?? true,
     outputDir: input.outputDir || '',
+    exactOutputDir: input.exactOutputDir || input.outputPath || '',
     verboseLog: input.verboseLog ?? true
   };
 }
@@ -1902,6 +2201,113 @@ function createTask(options) {
   state.tasks.set(id, task);
   setImmediate(() => runExport(task));
   return task;
+}
+
+
+function createMergeTask(options) {
+  const id = crypto.randomUUID();
+  const task = {
+    id,
+    status: 'queued',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    progress: 0,
+    progressPercent: '0%',
+    message: '排队中',
+    messageCount: 0,
+    options: { operation: 'merge', ...(options || {}) },
+    logs: [],
+    stopRequested: false,
+    incompleteWindows: [],
+    result: null
+  };
+  state.tasks.set(id, task);
+  setImmediate(() => runMergeTask(task));
+  return task;
+}
+
+async function runMergeTask(task) {
+  try {
+    updateTask(task, { status: 'running', message: '读取待合并记录', progress: 5 });
+    const body = task.options || {};
+    const history = loadHistory();
+    const ids = Array.isArray(body.historyIds) ? body.historyIds.map(String) : [];
+    const selected = ids.map(id => history.find(h => String(h.id) === id)).filter(Boolean);
+    const sourceDirs = [
+      ...selected.map(h => h.outputDir),
+      ...(Array.isArray(body.sourceDirs) ? body.sourceDirs : [])
+    ].filter(Boolean);
+    if (sourceDirs.length < 1) throw new Error('至少需要一个 historyIds 或 sourceDirs');
+
+    const declaredType = body.chatType || body.sessionType || selected[0]?.sessionType || selected[0]?.peer?.typeName || '';
+    const declaredId = String(body.id || body.sessionId || selected[0]?.sessionId || selected[0]?.peer?.uin || selected[0]?.peer?.peerUid || '');
+    for (const rec of selected) {
+      if (declaredType && canonicalSessionType(rec.sessionType || rec.peer?.typeName) !== canonicalSessionType(declaredType)) throw new Error('拒绝合并不同类型的会话');
+      if (declaredId && historySessionId(rec) !== declaredId) throw new Error('拒绝合并不同会话 ID 的记录');
+    }
+
+    const lists = [];
+    for (let i = 0; i < sourceDirs.length; i++) {
+      if (task.stopRequested) throw new Error('STOP_REQUESTED');
+      const arr = await loadMessagesFromOutputDir(sourceDirs[i]);
+      lists.push(arr);
+      updateTask(task, { progress: Math.min(60, 10 + Math.round((i + 1) / sourceDirs.length * 50)), message: `已读取 ${i + 1}/${sourceDirs.length}`, messageCount: lists.reduce((n, x) => n + x.length, 0) });
+      pushTaskLog(task, `读取合并源 ${sourceDirs[i]}：${arr.length} 条`);
+    }
+    const merged = mergeNormalizedMessages(...lists);
+    const peer = {
+      typeName: canonicalSessionType(declaredType),
+      name: String(body.name || body.sessionName || selected[0]?.sessionName || selected[0]?.peer?.name || declaredId || 'merged'),
+      uin: declaredId,
+      peerUid: String(body.peerUid || selected[0]?.peer?.peerUid || declaredId)
+    };
+    const stamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
+    const outDir = body.exactOutputDir || body.outputPath || (body.outputDir ? path.join(body.outputDir, `${peer.typeName}_${safeName(peer.name)}_${safeName(declaredId)}_${stamp}_merged`) : path.join(state.exportsDir, `${peer.typeName}_${safeName(peer.name)}_${safeName(declaredId)}_${stamp}_merged`));
+    ensureDir(outDir);
+    updateTask(task, { progress: 70, message: '写入合并结果', messageCount: merged.length });
+    const jsonl = await writeChunkedJsonlFromMessages(outDir, peer, merged, task);
+    const stats = jsonl.stats;
+    const seqStats = normalizedSeqRange(merged);
+    const record = {
+      id: task.id,
+      createdAt: task.createdAt,
+      completedAt: new Date().toISOString(),
+      outputDir: outDir,
+      peer,
+      options: task.options,
+      messageCount: merged.length,
+      latestTimestamp: stats.timeRange.end ? new Date(stats.timeRange.end).getTime() : 0,
+      earliestTimestamp: stats.timeRange.start ? new Date(stats.timeRange.start).getTime() : 0,
+      latestSeq: seqStats.max,
+      earliestSeq: seqStats.min,
+      sourceHistoryIds: ids,
+      sourceDirs,
+      outputs: [jsonl.file],
+      sessionType: peer.typeName,
+      sessionId: declaredId,
+      sessionName: peer.name,
+      formats: ['jsonl'],
+      latestTime: stats.timeRange.end || '',
+      earliestTime: stats.timeRange.start || ''
+    };
+    registerExportHistory(record);
+    updateTask(task, { status: 'completed', progress: 100, message: '合并完成', messageCount: merged.length, result: { ...record, paths: record.outputs } });
+    pushTaskLog(task, `合并完成：输入=${lists.reduce((n, x) => n + x.length, 0)} 输出=${merged.length} 去重=${lists.reduce((n, x) => n + x.length, 0) - merged.length}`);
+  } catch (err) {
+    if (err?.message === 'STOP_REQUESTED') updateTask(task, { status: 'stopped', message: '已停止' });
+    else {
+      updateTask(task, { status: 'failed', message: err?.message || String(err), error: err?.stack || String(err) });
+      pushTaskLog(task, `合并失败：${err?.message || err}`);
+    }
+  } finally {
+    cleanupAfterExport(task);
+  }
+}
+
+async function findRecordOrTaskOutput(id) {
+  const task = state.tasks.get(String(id));
+  if (task?.result?.outputDir) return task.result;
+  return loadHistory().find(h => String(h.id) === String(id)) || null;
 }
 
 function sendJson(res, obj, code = 200) {
@@ -1949,10 +2355,10 @@ async function handleApi(req, res, urlObj) {
   try {
     if (req.method === 'OPTIONS') return sendJson(res, {});
     if (urlObj.pathname === '/api/config') {
-      return sendJson(res, { ok: true, defaultExportDir: state.exportsDir, defaultBaseUrl: '', version: VERSION, dataDir: state.dataDir });
+      return sendJson(res, { ok: true, defaultExportDir: state.exportsDir, defaultBaseUrl: `http://${LISTEN_HOST}:${state.port}`, version: VERSION, dataDir: state.dataDir, incrementalOverlapMs: DEFAULT_INCREMENTAL_OVERLAP_MS, incrementalOverlapSeq: DEFAULT_INCREMENTAL_OVERLAP_SEQ, chunkedFileApi: true });
     }
     if (urlObj.pathname === '/api/status') {
-      return sendJson(res, { ok: true, version: VERSION, port: state.port, dataDir: state.dataDir, exportsDir: state.exportsDir, channel: getChannel(), buildVersion: getBuildVersion(), self: getSelfInfo() });
+      return sendJson(res, { ok: true, version: VERSION, host: LISTEN_HOST, port: state.port, dataDir: state.dataDir, exportsDir: state.exportsDir, channel: getChannel(), buildVersion: getBuildVersion(), self: getSelfInfo(), chunkedFileApi: true });
     }
     if (urlObj.pathname === '/api/logs') {
       return sendJson(res, { logs: state.logs });
@@ -1966,6 +2372,32 @@ async function handleApi(req, res, urlObj) {
       if (q) history = history.filter(h => [h.sessionType, h.sessionId, h.sessionName, h.outputDir].some(v => String(v || '').toLowerCase().includes(q)));
       return sendJson(res, { ok: true, history });
     }
+    if (urlObj.pathname === '/api/history/latest') {
+      const sessionType = canonicalSessionType(urlObj.searchParams.get('sessionType') || urlObj.searchParams.get('chatType'));
+      const sessionId = String(urlObj.searchParams.get('sessionId') || urlObj.searchParams.get('id') || '');
+      const record = loadHistory().map(compatHistoryRecord)
+        .filter(h => canonicalSessionType(h.sessionType) === sessionType && (!sessionId || String(h.sessionId) === sessionId))
+        .sort((a, b) => String(b.completedAt).localeCompare(String(a.completedAt)))[0] || null;
+      return sendJson(res, { ok: true, history: record });
+    }
+    const historyManifestMatch = urlObj.pathname.match(/^\/api\/history\/([^/]+)\/manifest$/);
+    if (historyManifestMatch && req.method === 'GET') {
+      const record = await findRecordOrTaskOutput(decodeURIComponent(historyManifestMatch[1]));
+      if (!record?.outputDir) return sendJson(res, { ok: false, error: 'history not found' }, 404);
+      return await sendChunkedOutputManifest(record, res);
+    }
+    const historyFileMatch = urlObj.pathname.match(/^\/api\/history\/([^/]+)\/files\/(.+)$/);
+    if (historyFileMatch && req.method === 'GET') {
+      const record = await findRecordOrTaskOutput(decodeURIComponent(historyFileMatch[1]));
+      if (!record?.outputDir) return sendJson(res, { ok: false, error: 'history not found' }, 404);
+      return await streamDeclaredOutputFile(record, decodeURIComponent(historyFileMatch[2]), res);
+    }
+    const historyMessagesMatch = urlObj.pathname.match(/^\/api\/history\/([^/]+)\/messages$/);
+    if (historyMessagesMatch && req.method === 'GET') {
+      const record = await findRecordOrTaskOutput(decodeURIComponent(historyMessagesMatch[1]));
+      if (!record?.outputDir) return sendJson(res, { ok: false, error: 'history not found' }, 404);
+      return await streamMessagesFromOutputDir(record.outputDir, res);
+    }
     if (urlObj.pathname === '/api/tasks') {
       return sendJson(res, { tasks: Array.from(state.tasks.values()).map(t => ({ ...t, logs: t.logs.slice(-80) })) });
     }
@@ -1973,6 +2405,24 @@ async function handleApi(req, res, urlObj) {
       const id = urlObj.searchParams.get('id');
       const t = state.tasks.get(id);
       return sendJson(res, t ? { task: t } : { error: 'task not found' }, t ? 200 : 404);
+    }
+    const jobManifestMatch = urlObj.pathname.match(/^\/api\/jobs\/([^/]+)\/manifest$/);
+    if (jobManifestMatch && req.method === 'GET') {
+      const record = await findRecordOrTaskOutput(decodeURIComponent(jobManifestMatch[1]));
+      if (!record?.outputDir) return sendJson(res, { ok: false, error: 'job result not ready' }, 409);
+      return await sendChunkedOutputManifest(record, res);
+    }
+    const jobFileMatch = urlObj.pathname.match(/^\/api\/jobs\/([^/]+)\/files\/(.+)$/);
+    if (jobFileMatch && req.method === 'GET') {
+      const record = await findRecordOrTaskOutput(decodeURIComponent(jobFileMatch[1]));
+      if (!record?.outputDir) return sendJson(res, { ok: false, error: 'job result not ready' }, 409);
+      return await streamDeclaredOutputFile(record, decodeURIComponent(jobFileMatch[2]), res);
+    }
+    const jobMessagesMatch = urlObj.pathname.match(/^\/api\/jobs\/([^/]+)\/messages$/);
+    if (jobMessagesMatch && req.method === 'GET') {
+      const record = await findRecordOrTaskOutput(decodeURIComponent(jobMessagesMatch[1]));
+      if (!record?.outputDir) return sendJson(res, { ok: false, error: 'job result not ready' }, 409);
+      return await streamMessagesFromOutputDir(record.outputDir, res);
     }
     const jobMatch = urlObj.pathname.match(/^\/api\/jobs\/([^/]+)$/);
     if (jobMatch && req.method === 'GET') {
@@ -1987,9 +2437,19 @@ async function handleApi(req, res, urlObj) {
       pushTaskLog(t, '已请求提前停止；会在当前接口请求/资源下载批次结束后保存已获取内容');
       return sendJson(res, { ok: true });
     }
-    if (urlObj.pathname === '/api/export' && req.method === 'POST') {
+    if ((urlObj.pathname === '/api/export' || urlObj.pathname === '/api/sync') && req.method === 'POST') {
       const body = await readBody(req);
+      if (urlObj.pathname === '/api/sync') {
+        body.incremental = body.incremental ?? true;
+        body.autoMergeIncremental = body.autoMergeIncremental ?? true;
+        body.format = body.format || 'jsonl';
+      }
       const task = createTask(body);
+      return sendJson(res, { ok: true, taskId: task.id, jobId: task.id, task });
+    }
+    if (urlObj.pathname === '/api/merge' && req.method === 'POST') {
+      const body = await readBody(req);
+      const task = createMergeTask(body);
       return sendJson(res, { ok: true, taskId: task.id, jobId: task.id, task });
     }
     if (urlObj.pathname === '/api/stop' && req.method === 'POST') {
@@ -2026,7 +2486,7 @@ async function handleApi(req, res, urlObj) {
 const HTML = Buffer.from('PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9InpoLUNOIj48aGVhZD48bWV0YSBjaGFyc2V0PSJ1dGYtOCI+PG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xIj48dGl0bGU+cXFfZXhwb3J0PC90aXRsZT48c3R5bGU+Cjpyb290e2NvbG9yLXNjaGVtZTpsaWdodCBkYXJrfWJvZHl7Zm9udC1mYW1pbHk6LWFwcGxlLXN5c3RlbSxCbGlua01hY1N5c3RlbUZvbnQsIlNlZ29lIFVJIixzYW5zLXNlcmlmO21hcmdpbjowO2JhY2tncm91bmQ6Q2FudmFzO2NvbG9yOkNhbnZhc1RleHR9bWFpbnttYXgtd2lkdGg6MTE2MHB4O21hcmdpbjoyOHB4IGF1dG87cGFkZGluZzowIDE4cHggNDJweH1oMXtmb250LXNpemU6MjhweDttYXJnaW46MCAwIDE4cHh9aDJ7Zm9udC1zaXplOjE4cHg7bWFyZ2luOjAgMCAxNHB4fXNlY3Rpb257Ym9yZGVyOjFweCBzb2xpZCBjb2xvci1taXgoaW4gc3JnYixDYW52YXNUZXh0IDE4JSx0cmFuc3BhcmVudCk7Ym9yZGVyLXJhZGl1czoxNHB4O3BhZGRpbmc6MThweDttYXJnaW46MTZweCAwO2JhY2tncm91bmQ6Y29sb3ItbWl4KGluIHNyZ2IsQ2FudmFzIDk2JSxDYW52YXNUZXh0IDQlKX0udGFic3tkaXNwbGF5OmZsZXg7Z2FwOjhweDttYXJnaW46MCAwIDE2cHh9LnRhYnt3aWR0aDphdXRvO3BhZGRpbmc6MTBweCAxNnB4O2JvcmRlci1yYWRpdXM6OTk5cHh9LnRhYi5hY3RpdmV7YmFja2dyb3VuZDpIaWdobGlnaHQ7Y29sb3I6SGlnaGxpZ2h0VGV4dDtib3JkZXItY29sb3I6SGlnaGxpZ2h0O2ZvbnQtd2VpZ2h0OjYwMH0ucGFuZWx7ZGlzcGxheTpub25lfS5wYW5lbC5hY3RpdmV7ZGlzcGxheTpibG9ja30uZ3JpZHtkaXNwbGF5OmdyaWQ7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOnJlcGVhdCgyLG1pbm1heCgwLDFmcikpO2dhcDoxMnB4fS5ncmlkM3tkaXNwbGF5OmdyaWQ7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOnJlcGVhdCgzLG1pbm1heCgwLDFmcikpO2dhcDoxMnB4fS5ncmlkNHtkaXNwbGF5OmdyaWQ7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOnJlcGVhdCg0LG1pbm1heCgwLDFmcikpO2dhcDoxMnB4fWxhYmVse2Rpc3BsYXk6YmxvY2s7Zm9udC1zaXplOjEzcHg7bWFyZ2luLWJvdHRvbTo1cHg7Y29sb3I6Y29sb3ItbWl4KGluIHNyZ2IsQ2FudmFzVGV4dCA3MiUsdHJhbnNwYXJlbnQpfWlucHV0LHNlbGVjdCxidXR0b257Ym94LXNpemluZzpib3JkZXItYm94O3dpZHRoOjEwMCU7Ym9yZGVyLXJhZGl1czoxMHB4O2JvcmRlcjoxcHggc29saWQgY29sb3ItbWl4KGluIHNyZ2IsQ2FudmFzVGV4dCAyMiUsdHJhbnNwYXJlbnQpO3BhZGRpbmc6MTBweCAxMXB4O2ZvbnQtc2l6ZToxNHB4O2JhY2tncm91bmQ6Q2FudmFzO2NvbG9yOkNhbnZhc1RleHR9YnV0dG9ue2N1cnNvcjpwb2ludGVyO2JhY2tncm91bmQ6Y29sb3ItbWl4KGluIHNyZ2IsSGlnaGxpZ2h0IDEyJSxDYW52YXMpO2JvcmRlci1jb2xvcjpjb2xvci1taXgoaW4gc3JnYixIaWdobGlnaHQgNTUlLENhbnZhc1RleHQgMTUlKX1idXR0b24ucHJpbWFyeXtiYWNrZ3JvdW5kOkhpZ2hsaWdodDtjb2xvcjpIaWdobGlnaHRUZXh0O2JvcmRlci1jb2xvcjpIaWdobGlnaHQ7Zm9udC13ZWlnaHQ6NjAwfWJ1dHRvbi5kYW5nZXJ7YmFja2dyb3VuZDpjb2xvci1taXgoaW4gc3JnYixyZWQgMTglLENhbnZhcyk7Ym9yZGVyLWNvbG9yOmNvbG9yLW1peChpbiBzcmdiLHJlZCA1NSUsQ2FudmFzVGV4dCAxNSUpfWJ1dHRvbjpkaXNhYmxlZHtvcGFjaXR5Oi41NTtjdXJzb3I6bm90LWFsbG93ZWR9LnJvd3tkaXNwbGF5OmZsZXg7Z2FwOjEwcHg7YWxpZ24taXRlbXM6ZW5kfS5yb3c+KntmbGV4OjF9LmNoZWNrc3tkaXNwbGF5OmZsZXg7ZmxleC13cmFwOndyYXA7Z2FwOjE0cHg7YWxpZ24taXRlbXM6Y2VudGVyO21hcmdpbi10b3A6MTBweH0uY2hlY2tzIGxhYmVse2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjZweDttYXJnaW46MH1pbnB1dFt0eXBlPWNoZWNrYm94XXt3aWR0aDphdXRvfXRhYmxle3dpZHRoOjEwMCU7Ym9yZGVyLWNvbGxhcHNlOmNvbGxhcHNlO2ZvbnQtc2l6ZToxM3B4fXRoLHRke2JvcmRlci1ib3R0b206MXB4IHNvbGlkIGNvbG9yLW1peChpbiBzcmdiLENhbnZhc1RleHQgMTIlLHRyYW5zcGFyZW50KTtwYWRkaW5nOjlweCA3cHg7dGV4dC1hbGlnbjpsZWZ0O3ZlcnRpY2FsLWFsaWduOnRvcH10Ym9keSB0ci5zZWxlY3RhYmxle2N1cnNvcjpwb2ludGVyfXRib2R5IHRyLnNlbGVjdGFibGU6aG92ZXJ7YmFja2dyb3VuZDpjb2xvci1taXgoaW4gc3JnYixIaWdobGlnaHQgMTAlLHRyYW5zcGFyZW50KX10Ym9keSB0ci5zZWxlY3RlZHtiYWNrZ3JvdW5kOmNvbG9yLW1peChpbiBzcmdiLEhpZ2hsaWdodCAyMiUsdHJhbnNwYXJlbnQpfWNvZGUscHJle2ZvbnQtZmFtaWx5OnVpLW1vbm9zcGFjZSxTRk1vbm8tUmVndWxhcixNZW5sbyxDb25zb2xhcyxtb25vc3BhY2V9cHJle2JhY2tncm91bmQ6Y29sb3ItbWl4KGluIHNyZ2IsQ2FudmFzVGV4dCA4JSx0cmFuc3BhcmVudCk7cGFkZGluZzoxMnB4O2JvcmRlci1yYWRpdXM6MTJweDtvdmVyZmxvdzphdXRvO21heC1oZWlnaHQ6MzIwcHh9cHJvZ3Jlc3N7d2lkdGg6MTAwJTtoZWlnaHQ6MThweH0uc3RhdHVze2Rpc3BsYXk6Z3JpZDtncmlkLXRlbXBsYXRlLWNvbHVtbnM6MWZyIGF1dG87Z2FwOjEwcHg7YWxpZ24taXRlbXM6Y2VudGVyfS5zbWFsbHtmb250LXNpemU6MTJweDtjb2xvcjpjb2xvci1taXgoaW4gc3JnYixDYW52YXNUZXh0IDY1JSx0cmFuc3BhcmVudCl9LnBpbGx7ZGlzcGxheTppbmxpbmUtYmxvY2s7cGFkZGluZzoycHggOHB4O2JvcmRlci1yYWRpdXM6OTk5cHg7YmFja2dyb3VuZDpjb2xvci1taXgoaW4gc3JnYixIaWdobGlnaHQgMTIlLHRyYW5zcGFyZW50KTttYXJnaW4tcmlnaHQ6NnB4O2ZvbnQtc2l6ZToxMnB4fS5hY3Rpb25ze2Rpc3BsYXk6ZmxleDtnYXA6OHB4O2ZsZXgtd3JhcDp3cmFwfS5hY3Rpb25zIGJ1dHRvbnt3aWR0aDphdXRvO3BhZGRpbmc6N3B4IDEwcHh9Lmhpc3RvcnktdG9vbHN7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnIgYXV0bztnYXA6MTBweDthbGlnbi1pdGVtczplbmR9Lmhpc3RvcnktbGlzdHtkaXNwbGF5OmdyaWQ7Z2FwOjEwcHh9Lmhpc3RvcnktY2FyZHtib3JkZXI6MXB4IHNvbGlkIGNvbG9yLW1peChpbiBzcmdiLENhbnZhc1RleHQgMTQlLHRyYW5zcGFyZW50KTtib3JkZXItcmFkaXVzOjEycHg7cGFkZGluZzoxMnB4O2Rpc3BsYXk6Z3JpZDtncmlkLXRlbXBsYXRlLWNvbHVtbnM6bWlubWF4KDAsMS4yZnIpIDExMHB4IG1pbm1heCgwLDFmcikgYXV0bztnYXA6MTJweDthbGlnbi1pdGVtczpjZW50ZXJ9Lmhpc3RvcnktY2FyZCBzdHJvbmd7ZGlzcGxheTpibG9jazttYXJnaW4tYm90dG9tOjRweH0uaGlzdG9yeS1jYXJkIGNvZGV7d29yZC1icmVhazpicmVhay1hbGx9QG1lZGlhKG1heC13aWR0aDo4NjBweCl7LmdyaWQsLmdyaWQzLC5ncmlkNCwuaGlzdG9yeS1jYXJke2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnJ9LnJvd3tmbGV4LWRpcmVjdGlvbjpjb2x1bW47YWxpZ24taXRlbXM6c3RyZXRjaH0uc3RhdHVze2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnJ9fQo8L3N0eWxlPjwvaGVhZD48Ym9keT48bWFpbj48aDE+cXFfZXhwb3J0PC9oMT48ZGl2IGNsYXNzPSJ0YWJzIj48YnV0dG9uIGNsYXNzPSJ0YWIgYWN0aXZlIiBkYXRhLXRhYj0iZXhwb3J0UGFuZWwiPuaWsOW7uuWvvOWHujwvYnV0dG9uPjxidXR0b24gY2xhc3M9InRhYiIgZGF0YS10YWI9Imhpc3RvcnlQYW5lbCI+5Y6G5Y+y5a+85Ye6PC9idXR0b24+PC9kaXY+PGRpdiBpZD0iZXhwb3J0UGFuZWwiIGNsYXNzPSJwYW5lbCBhY3RpdmUiPjxzZWN0aW9uPjxoMj7kvJror508L2gyPjxkaXYgY2xhc3M9InJvdyI+PGRpdj48bGFiZWw+5pCc57SiIFFRL+e+pOWPt+OAgeeUqOaIty/nvqTlkI08L2xhYmVsPjxpbnB1dCBpZD0icXVlcnkiIHBsYWNlaG9sZGVyPSLnlZnnqbrlj6/miYvliqjovpPlhaUiPjwvZGl2PjxidXR0b24gaWQ9ImxvYWRTZXNzaW9ucyIgc3R5bGU9Im1heC13aWR0aDoxODBweCI+6K+75Y+W5Lya6K+d5YiX6KGoPC9idXR0b24+PC9kaXY+PGRpdiBjbGFzcz0iZ3JpZDMiIHN0eWxlPSJtYXJnaW4tdG9wOjEycHgiPjxkaXY+PGxhYmVsPuexu+WeizwvbGFiZWw+PHNlbGVjdCBpZD0ic2Vzc2lvblR5cGUiPjxvcHRpb24gdmFsdWU9InByaXZhdGUiPuengeiBijwvb3B0aW9uPjxvcHRpb24gdmFsdWU9Imdyb3VwIj7nvqTogYo8L29wdGlvbj48L3NlbGVjdD48L2Rpdj48ZGl2PjxsYWJlbD5RUS/nvqTlj7cg5oiWIFVJRDwvbGFiZWw+PGlucHV0IGlkPSJzZXNzaW9uSWQiIHBsYWNlaG9sZGVyPSLmiYvliqjovpPlhaUiPjwvZGl2PjxkaXY+PGxhYmVsPuaYvuekuuWQjeensDwvbGFiZWw+PGlucHV0IGlkPSJzZXNzaW9uTmFtZSIgcGxhY2Vob2xkZXI9IuWPr+mAiSI+PC9kaXY+PC9kaXY+PGRpdiBpZD0ic2Vzc2lvbkJveCIgc3R5bGU9Im1hcmdpbi10b3A6MTJweDtkaXNwbGF5Om5vbmUiPjx0YWJsZT48dGhlYWQ+PHRyPjx0aD7nsbvlnos8L3RoPjx0aD7lj7fnoIE8L3RoPjx0aD5VSUQ8L3RoPjx0aD7lkI3np7A8L3RoPjwvdHI+PC90aGVhZD48dGJvZHkgaWQ9InNlc3Npb25zIj48L3Rib2R5PjwvdGFibGU+PC9kaXY+PC9zZWN0aW9uPjxzZWN0aW9uPjxoMj7lr7zlh7rpgInpobk8L2gyPjxkaXYgY2xhc3M9ImdyaWQ0Ij48ZGl2PjxsYWJlbD7moLzlvI88L2xhYmVsPjxzZWxlY3QgaWQ9ImZvcm1hdCI+PG9wdGlvbiB2YWx1ZT0ianNvbiI+SlNPTjwvb3B0aW9uPjxvcHRpb24gdmFsdWU9Impzb25sIj5KU09OTDwvb3B0aW9uPjwvc2VsZWN0PjwvZGl2PjxkaXY+PGxhYmVsPuaXtumXtOiMg+WbtDwvbGFiZWw+PHNlbGVjdCBpZD0idGltZU1vZGUiPjxvcHRpb24gdmFsdWU9Im1hbnVhbCI+5omL5Yqo6L6T5YWlPC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0iYWxsIj7lhajpg6g8L29wdGlvbj48b3B0aW9uIHZhbHVlPSIxZCI+5pyA6L+RIDEg5aSpPC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0iMXciPuacgOi/kSAxIOWRqDwvb3B0aW9uPjxvcHRpb24gdmFsdWU9IjFtIj7mnIDov5EgMSDmnIg8L29wdGlvbj48b3B0aW9uIHZhbHVlPSIxeSI+5pyA6L+RIDEg5bm0PC9vcHRpb24+PC9zZWxlY3Q+PC9kaXY+PGRpdj48bGFiZWw+5q+P5om55raI5oGv5p2h5pWwPC9sYWJlbD48aW5wdXQgaWQ9ImJhdGNoU2l6ZSIgdHlwZT0ibnVtYmVyIiBtaW49IjIwIiBtYXg9IjIwMDAiIHZhbHVlPSIxMDAwIj48L2Rpdj48ZGl2PjxsYWJlbD7mnIDlpKfmtojmga/mlbA8L2xhYmVsPjxpbnB1dCBpZD0ibWF4TWVzc2FnZXMiIHR5cGU9Im51bWJlciIgbWluPSIwIiB2YWx1ZT0iMCI+PC9kaXY+PC9kaXY+PGRpdiBpZD0ibWFudWFsVGltZVJvdyIgY2xhc3M9ImdyaWQiIHN0eWxlPSJtYXJnaW4tdG9wOjEycHgiPjxkaXY+PGxhYmVsPuW8gOWni+aXtumXtDwvbGFiZWw+PGlucHV0IGlkPSJzdGFydFRpbWUiIHR5cGU9ImRhdGV0aW1lLWxvY2FsIj48L2Rpdj48ZGl2PjxsYWJlbD7nu5PmnZ/ml7bpl7Q8L2xhYmVsPjxpbnB1dCBpZD0iZW5kVGltZSIgdHlwZT0iZGF0ZXRpbWUtbG9jYWwiPjwvZGl2PjwvZGl2PjxkaXYgY2xhc3M9ImdyaWQzIiBzdHlsZT0ibWFyZ2luLXRvcDoxMnB4Ij48ZGl2PjxsYWJlbD7ljoblj7Llubblj5Hnur/nqIvmlbA8L2xhYmVsPjxpbnB1dCBpZD0iaGlzdG9yeVdvcmtlcnMiIHR5cGU9Im51bWJlciIgbWluPSIxIiBtYXg9IjQiIHZhbHVlPSI0Ij48L2Rpdj48ZGl2PjxsYWJlbD5TZXEg56qX5Y+j5aSn5bCPPC9sYWJlbD48aW5wdXQgaWQ9InNlcVdpbmRvd1NpemUiIHR5cGU9Im51bWJlciIgbWluPSIxMDAwIiB2YWx1ZT0iNTAwMDAiPjwvZGl2PjxkaXY+PGxhYmVsPuWksei0pemHjeivleasoeaVsDwvbGFiZWw+PGlucHV0IGlkPSJoaXN0b3J5UmV0cnlDb3VudCIgdHlwZT0ibnVtYmVyIiBtaW49IjUiIG1heD0iMjAiIHZhbHVlPSI1Ij48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJyb3ciIHN0eWxlPSJtYXJnaW4tdG9wOjEycHgiPjxkaXY+PGxhYmVsPuWvvOWHuuaWh+S7tuWkuTwvbGFiZWw+PGlucHV0IGlkPSJvdXRwdXREaXIiIHBsYWNlaG9sZGVyPSLnlZnnqbrkvb/nlKjpu5jorqTnm67lvZUiPjwvZGl2PjxidXR0b24gaWQ9ImNob29zZU91dHB1dERpciIgc3R5bGU9Im1heC13aWR0aDoxNTBweCI+6YCJ5oup5paH5Lu25aS5PC9idXR0b24+PC9kaXY+PGRpdiBjbGFzcz0iY2hlY2tzIj48bGFiZWw+PGlucHV0IGlkPSJpbmNsdWRlU3lzdGVtTWVzc2FnZXMiIHR5cGU9ImNoZWNrYm94IiBjaGVja2VkPiDlr7zlh7rns7vnu5/mtojmga88L2xhYmVsPjxsYWJlbD48aW5wdXQgaWQ9ImluY2x1ZGVSZWNhbGxlZE1lc3NhZ2VzIiB0eXBlPSJjaGVja2JveCI+IOWvvOWHuuW3suaSpOWbnueahOa2iOaBrzwvbGFiZWw+PGxhYmVsPjxpbnB1dCBpZD0icGFyYWxsZWxIaXN0b3J5IiB0eXBlPSJjaGVja2JveCIgY2hlY2tlZD4g5bm26KGM6K+75Y+W5Y6G5Y+yPC9sYWJlbD48bGFiZWw+PGlucHV0IGlkPSJpbmNsdWRlUmVzb3VyY2VzIiB0eXBlPSJjaGVja2JveCI+IOi1hOa6kOaWh+S7tjwvbGFiZWw+PC9kaXY+PGRpdiBjbGFzcz0iYWN0aW9ucyIgc3R5bGU9Im1hcmdpbi10b3A6MTZweCI+PGJ1dHRvbiBpZD0ic3RhcnRFeHBvcnQiIGNsYXNzPSJwcmltYXJ5Ij7lvIDlp4vlr7zlh7o8L2J1dHRvbj48YnV0dG9uIGlkPSJzdG9wRXhwb3J0IiBjbGFzcz0iZGFuZ2VyIiBkaXNhYmxlZD7mj5DliY3lgZzmraLlubbkv53lrZg8L2J1dHRvbj48L2Rpdj48L3NlY3Rpb24+PHNlY3Rpb24+PGgyPueKtuaAgTwvaDI+PGRpdiBjbGFzcz0ic3RhdHVzIj48cHJvZ3Jlc3MgaWQ9InByb2dyZXNzIiB2YWx1ZT0iMCIgbWF4PSIxMDAiPjwvcHJvZ3Jlc3M+PHN0cm9uZyBpZD0ic3RhdHVzVGV4dCI+aWRsZSAwJTwvc3Ryb25nPjwvZGl2PjxwIGlkPSJtZXNzYWdlIiBjbGFzcz0ic21hbGwiPjwvcD48cHJlIGlkPSJsb2dzIj48L3ByZT48ZGl2IGlkPSJyZXN1bHQiPjwvZGl2Pjwvc2VjdGlvbj48L2Rpdj48ZGl2IGlkPSJoaXN0b3J5UGFuZWwiIGNsYXNzPSJwYW5lbCI+PHNlY3Rpb24+PGgyPuWOhuWPsuWvvOWHujwvaDI+PGRpdiBjbGFzcz0iaGlzdG9yeS10b29scyI+PGRpdj48bGFiZWw+562b6YCJPC9sYWJlbD48aW5wdXQgaWQ9Imhpc3RvcnlRdWVyeSIgcGxhY2Vob2xkZXI9IuS8muivneWQjeOAgeWPt+eggeaIlui3r+W+hCI+PC9kaXY+PGJ1dHRvbiBpZD0ibG9hZEhpc3RvcnkiPuWIt+aWsDwvYnV0dG9uPjwvZGl2PjxkaXYgaWQ9Imhpc3RvcnlSb3dzIiBjbGFzcz0iaGlzdG9yeS1saXN0IiBzdHlsZT0ibWFyZ2luLXRvcDoxMnB4Ij48L2Rpdj48L3NlY3Rpb24+PC9kaXY+PC9tYWluPjxzY3JpcHQ+CmNvbnN0ICQ9aWQ9PmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKGlkKTtsZXQgc2VsZWN0ZWRTZXNzaW9uPW51bGwsc2VsZWN0ZWRIaXN0b3J5PW51bGwsY3VycmVudEpvYj1udWxsLHRpbWVyPW51bGw7YXN5bmMgZnVuY3Rpb24gYXBpKHBhdGgsb3B0cz17fSl7Y29uc3Qgcj1hd2FpdCBmZXRjaChwYXRoLG9wdHMpO2NvbnN0IHQ9YXdhaXQgci50ZXh0KCk7bGV0IGo9e307dHJ5e2o9dD9KU09OLnBhcnNlKHQpOnt9fWNhdGNoe3Rocm93IG5ldyBFcnJvcih0KX1pZighci5va3x8ai5lcnJvcnx8ai5vaz09PWZhbHNlKXRocm93IG5ldyBFcnJvcihqLmVycm9yfHxqLm1lc3NhZ2V8fHIuc3RhdHVzVGV4dCk7cmV0dXJuIGp9ZG9jdW1lbnQucXVlcnlTZWxlY3RvckFsbCgnLnRhYicpLmZvckVhY2goYj0+Yi5vbmNsaWNrPSgpPT5zZXRUYWIoYi5kYXRhc2V0LnRhYikpO2Z1bmN0aW9uIHNldFRhYihpZCl7ZG9jdW1lbnQucXVlcnlTZWxlY3RvckFsbCgnLnRhYicpLmZvckVhY2goeD0+eC5jbGFzc0xpc3QudG9nZ2xlKCdhY3RpdmUnLHguZGF0YXNldC50YWI9PT1pZCkpO2RvY3VtZW50LnF1ZXJ5U2VsZWN0b3JBbGwoJy5wYW5lbCcpLmZvckVhY2goeD0+eC5jbGFzc0xpc3QudG9nZ2xlKCdhY3RpdmUnLHguaWQ9PT1pZCkpO2lmKGlkPT09J2hpc3RvcnlQYW5lbCcpbG9hZEhpc3RvcnkoKX0kKCd0aW1lTW9kZScpLm9uY2hhbmdlPSgpPT57JCgnbWFudWFsVGltZVJvdycpLnN0eWxlLmRpc3BsYXk9JCgndGltZU1vZGUnKS52YWx1ZT09PSdtYW51YWwnPydncmlkJzonbm9uZSd9OyQoJ2Nob29zZU91dHB1dERpcicpLm9uY2xpY2s9YXN5bmMoKT0+e3RyeXtjb25zdCByPWF3YWl0IGFwaSgnL2FwaS9jaG9vc2UtZm9sZGVyJyx7bWV0aG9kOidQT1NUJ30pO2lmKHIucGF0aCkkKCdvdXRwdXREaXInKS52YWx1ZT1yLnBhdGh9Y2F0Y2goZSl7YWxlcnQoZS5tZXNzYWdlKX19OyQoJ2xvYWRTZXNzaW9ucycpLm9uY2xpY2s9YXN5bmMoKT0+eyQoJ3Nlc3Npb25zJykuaW5uZXJIVE1MPSc8dHI+PHRkIGNvbHNwYW49IjQiPuivu+WPluS4rS4uLjwvdGQ+PC90cj4nOyQoJ3Nlc3Npb25Cb3gnKS5zdHlsZS5kaXNwbGF5PSdibG9jayc7dHJ5e2NvbnN0IGRhdGE9YXdhaXQgYXBpKCcvYXBpL3Nlc3Npb25zP3E9JytlbmNvZGVVUklDb21wb25lbnQoJCgncXVlcnknKS52YWx1ZXx8JycpKTskKCdzZXNzaW9ucycpLmlubmVySFRNTD0nJztmb3IoY29uc3QgcyBvZiBkYXRhLnNlc3Npb25zKXtjb25zdCB0cj1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCd0cicpO3RyLmNsYXNzTmFtZT0nc2VsZWN0YWJsZSc7dHIuaW5uZXJIVE1MPWA8dGQ+JHtlc2NhcGVIdG1sKHMudHlwZSl9PC90ZD48dGQ+PGNvZGU+JHtlc2NhcGVIdG1sKHMudWlufHxzLmlkfHwnJyl9PC9jb2RlPjwvdGQ+PHRkPjxjb2RlPiR7ZXNjYXBlSHRtbChzLnVpZHx8JycpfTwvY29kZT48L3RkPjx0ZD4ke2VzY2FwZUh0bWwocy5uYW1lfHwnJyl9PC90ZD5gO3RyLm9uY2xpY2s9KCk9Pntkb2N1bWVudC5xdWVyeVNlbGVjdG9yQWxsKCcjc2Vzc2lvbnMgdHInKS5mb3JFYWNoKHg9PnguY2xhc3NMaXN0LnJlbW92ZSgnc2VsZWN0ZWQnKSk7dHIuY2xhc3NMaXN0LmFkZCgnc2VsZWN0ZWQnKTtmaWxsU2Vzc2lvbihzKX07JCgnc2Vzc2lvbnMnKS5hcHBlbmRDaGlsZCh0cil9aWYoIWRhdGEuc2Vzc2lvbnMubGVuZ3RoKSQoJ3Nlc3Npb25zJykuaW5uZXJIVE1MPSc8dHI+PHRkIGNvbHNwYW49IjQiPuayoeacieWMuemFjee7k+aenO+8jOWPr+ebtOaOpeaJi+WKqOi+k+WFpeOAgjwvdGQ+PC90cj4nfWNhdGNoKGUpeyQoJ3Nlc3Npb25zJykuaW5uZXJIVE1MPWA8dHI+PHRkIGNvbHNwYW49IjQiPiR7ZXNjYXBlSHRtbChlLm1lc3NhZ2UpfTwvdGQ+PC90cj5gfX07ZnVuY3Rpb24gZmlsbFNlc3Npb24ocyl7c2VsZWN0ZWRTZXNzaW9uPXM7JCgnc2Vzc2lvblR5cGUnKS52YWx1ZT1zLnR5cGU9PT0nZ3JvdXAnPydncm91cCc6J3ByaXZhdGUnOyQoJ3Nlc3Npb25JZCcpLnZhbHVlPXMudWlufHxzLmlkfHxzLnVpZHx8Jyc7JCgnc2Vzc2lvbk5hbWUnKS52YWx1ZT1zLm5hbWV8fHMuaWR8fCcnfSQoJ2xvYWRIaXN0b3J5Jykub25jbGljaz1sb2FkSGlzdG9yeTthc3luYyBmdW5jdGlvbiBsb2FkSGlzdG9yeSgpeyQoJ2hpc3RvcnlSb3dzJykuaW5uZXJIVE1MPSc8ZGl2IGNsYXNzPSJoaXN0b3J5LWNhcmQiPuivu+WPluS4rS4uLjwvZGl2Pic7dHJ5e2NvbnN0IHE9ZW5jb2RlVVJJQ29tcG9uZW50KCQoJ2hpc3RvcnlRdWVyeScpLnZhbHVlfHwnJyk7Y29uc3QgZGF0YT1hd2FpdCBhcGkoJy9hcGkvaGlzdG9yeT9xPScrcSk7JCgnaGlzdG9yeVJvd3MnKS5pbm5lckhUTUw9Jyc7Zm9yKGNvbnN0IHJlYyBvZiBkYXRhLmhpc3RvcnkpYWRkSGlzdG9yeUNhcmQocmVjKTtpZighZGF0YS5oaXN0b3J5Lmxlbmd0aCkkKCdoaXN0b3J5Um93cycpLmlubmVySFRNTD0nPGRpdiBjbGFzcz0iaGlzdG9yeS1jYXJkIj7msqHmnInljoblj7LorrDlvZXjgII8L2Rpdj4nfWNhdGNoKGUpeyQoJ2hpc3RvcnlSb3dzJykuaW5uZXJIVE1MPWA8ZGl2IGNsYXNzPSJoaXN0b3J5LWNhcmQiPiR7ZXNjYXBlSHRtbChlLm1lc3NhZ2UpfTwvZGl2PmB9fWZ1bmN0aW9uIGFkZEhpc3RvcnlDYXJkKHJlYyl7Y29uc3QgZGl2PWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ2RpdicpO2Rpdi5jbGFzc05hbWU9J2hpc3RvcnktY2FyZCc7Y29uc3QgdGFncz1bcmVjLnNlc3Npb25UeXBlLC4uLihyZWMuZm9ybWF0c3x8W10pXS5maWx0ZXIoQm9vbGVhbikubWFwKHg9PmA8c3BhbiBjbGFzcz0icGlsbCI+JHtlc2NhcGVIdG1sKHgpfTwvc3Bhbj5gKS5qb2luKCcnKTtkaXYuaW5uZXJIVE1MPWA8ZGl2PiR7dGFnc308c3Ryb25nPiR7ZXNjYXBlSHRtbChyZWMuc2Vzc2lvbk5hbWV8fCco5pyq5ZG95ZCNKScpfTwvc3Ryb25nPjxjb2RlPiR7ZXNjYXBlSHRtbChyZWMuc2Vzc2lvbklkfHwnJyl9PC9jb2RlPjwvZGl2PjxkaXY+JHtOdW1iZXIocmVjLm1lc3NhZ2VDb3VudHx8MCkudG9Mb2NhbGVTdHJpbmcoKX0g5p2hPC9kaXY+PGRpdj48Y29kZT4ke2VzY2FwZUh0bWwocmVjLmxhdGVzdFRpbWV8fCcnKX08L2NvZGU+PGJyPjxjb2RlPiR7ZXNjYXBlSHRtbChyZWMub3V0cHV0RGlyfHwnJyl9PC9jb2RlPjwvZGl2PjxkaXYgY2xhc3M9ImFjdGlvbnMiPjxidXR0b24gZGF0YS1hY3Q9ImZpbGwiPuWhq+WFpTwvYnV0dG9uPjxidXR0b24gZGF0YS1hY3Q9ImluYyI+5aKe6YeP5pu05pawPC9idXR0b24+PGJ1dHRvbiBkYXRhLWFjdD0ib3BlbiI+5omT5byA55uu5b2VPC9idXR0b24+PC9kaXY+YDtkaXYucXVlcnlTZWxlY3RvcignW2RhdGEtYWN0PWZpbGxdJykub25jbGljaz0oKT0+e3NlbGVjdGVkSGlzdG9yeT1yZWM7c2VsZWN0ZWRTZXNzaW9uPW51bGw7JCgnc2Vzc2lvblR5cGUnKS52YWx1ZT1yZWMuc2Vzc2lvblR5cGU9PT0nZ3JvdXAnPydncm91cCc6J3ByaXZhdGUnOyQoJ3Nlc3Npb25JZCcpLnZhbHVlPXJlYy5zZXNzaW9uSWR8fCcnOyQoJ3Nlc3Npb25OYW1lJykudmFsdWU9cmVjLnNlc3Npb25OYW1lfHwnJztzZXRUYWIoJ2V4cG9ydFBhbmVsJyl9O2Rpdi5xdWVyeVNlbGVjdG9yKCdbZGF0YS1hY3Q9aW5jXScpLm9uY2xpY2s9KCk9PntzZWxlY3RlZEhpc3Rvcnk9cmVjO3NlbGVjdGVkU2Vzc2lvbj1udWxsOyQoJ3Nlc3Npb25UeXBlJykudmFsdWU9cmVjLnNlc3Npb25UeXBlPT09J2dyb3VwJz8nZ3JvdXAnOidwcml2YXRlJzskKCdzZXNzaW9uSWQnKS52YWx1ZT1yZWMuc2Vzc2lvbklkfHwnJzskKCdzZXNzaW9uTmFtZScpLnZhbHVlPXJlYy5zZXNzaW9uTmFtZXx8Jyc7c2V0VGFiKCdleHBvcnRQYW5lbCcpO3N0YXJ0RXhwb3J0KHRydWUpfTtkaXYucXVlcnlTZWxlY3RvcignW2RhdGEtYWN0PW9wZW5dJykub25jbGljaz0oKT0+YXBpKCcvYXBpL29wZW4tZm9sZGVyJyx7bWV0aG9kOidQT1NUJyxoZWFkZXJzOnsnQ29udGVudC1UeXBlJzonYXBwbGljYXRpb24vanNvbid9LGJvZHk6SlNPTi5zdHJpbmdpZnkoe3BhdGg6cmVjLm91dHB1dERpcn0pfSkuY2F0Y2goZT0+YWxlcnQoZS5tZXNzYWdlKSk7JCgnaGlzdG9yeVJvd3MnKS5hcHBlbmRDaGlsZChkaXYpfSQoJ3N0YXJ0RXhwb3J0Jykub25jbGljaz0oKT0+c3RhcnRFeHBvcnQoZmFsc2UpO2FzeW5jIGZ1bmN0aW9uIHN0YXJ0RXhwb3J0KGluY3JlbWVudGFsKXtjb25zdCB1c2VJbmM9ISFpbmNyZW1lbnRhbDtpZih1c2VJbmMmJighc2VsZWN0ZWRIaXN0b3J5fHwhc2VsZWN0ZWRIaXN0b3J5LmxhdGVzdFRpbWVzdGFtcCkpe2FsZXJ0KCfmsqHmnInlj6/nlKjnmoTlop7ph4/ln7rlh4bjgIInKTtyZXR1cm59Y29uc3QgcGF5bG9hZD17Y2hhdFR5cGU6JCgnc2Vzc2lvblR5cGUnKS52YWx1ZSxpZDokKCdzZXNzaW9uSWQnKS52YWx1ZSxzZXNzaW9uSWQ6JCgnc2Vzc2lvbklkJykudmFsdWUscGVlclVpZDpzZWxlY3RlZFNlc3Npb24/LnVpZHx8JycsdWluOnNlbGVjdGVkU2Vzc2lvbj8udWlufHwkKCdzZXNzaW9uSWQnKS52YWx1ZSxuYW1lOiQoJ3Nlc3Npb25OYW1lJykudmFsdWUsc2Vzc2lvbk5hbWU6JCgnc2Vzc2lvbk5hbWUnKS52YWx1ZSxmb3JtYXQ6JCgnZm9ybWF0JykudmFsdWUsdGltZVByZXNldDp1c2VJbmM/J2FsbCc6JCgndGltZU1vZGUnKS52YWx1ZSxmcm9tOiQoJ3N0YXJ0VGltZScpLnZhbHVlLHRvOiQoJ2VuZFRpbWUnKS52YWx1ZSxpbmNyZW1lbnRhbDp1c2VJbmMsaW5jcmVtZW50YWxCYXNlSWQ6dXNlSW5jP3NlbGVjdGVkSGlzdG9yeS5pZDpudWxsLGluY3JlbWVudGFsU3RhcnRUaW1lc3RhbXA6dXNlSW5jP3NlbGVjdGVkSGlzdG9yeS5sYXRlc3RUaW1lc3RhbXA6bnVsbCxiYXRjaENvdW50Ok51bWJlcigkKCdiYXRjaFNpemUnKS52YWx1ZXx8MTAwMCksbWF4TWVzc2FnZXM6TnVtYmVyKCQoJ21heE1lc3NhZ2VzJykudmFsdWV8fDApLHJlc291cmNlV29ya2VyczozLHBhcmFsbGVsSGlzdG9yeTokKCdwYXJhbGxlbEhpc3RvcnknKS5jaGVja2VkLGhpc3RvcnlXb3JrZXJzOk51bWJlcigkKCdoaXN0b3J5V29ya2VycycpLnZhbHVlfHw0KSxzZXFXaW5kb3c6TnVtYmVyKCQoJ3NlcVdpbmRvd1NpemUnKS52YWx1ZXx8NTAwMDApLG91dHB1dERpcjokKCdvdXRwdXREaXInKS52YWx1ZSxpbmNsdWRlU3lzdGVtOiQoJ2luY2x1ZGVTeXN0ZW1NZXNzYWdlcycpLmNoZWNrZWQsaW5jbHVkZVJlY2FsbGVkOiQoJ2luY2x1ZGVSZWNhbGxlZE1lc3NhZ2VzJykuY2hlY2tlZCxleHBvcnRSZXNvdXJjZXM6JCgnaW5jbHVkZVJlc291cmNlcycpLmNoZWNrZWQsaGlzdG9yeVJldHJ5Q291bnQ6TnVtYmVyKCQoJ2hpc3RvcnlSZXRyeUNvdW50JykudmFsdWV8fDUpfTtpZighU3RyaW5nKHBheWxvYWQuaWR8fHBheWxvYWQucGVlclVpZCkudHJpbSgpKXthbGVydCgn6K+35omL5Yqo6L6T5YWl5oiW6YCJ5oupIFFRL+e+pOWPt+OAgicpO3JldHVybn0kKCdyZXN1bHQnKS5pbm5lckhUTUw9Jyc7JCgnbG9ncycpLnRleHRDb250ZW50PScnOyQoJ3Byb2dyZXNzJykudmFsdWU9MDskKCdzdGF0dXNUZXh0JykudGV4dENvbnRlbnQ9J3BlbmRpbmcgMCUnOyQoJ3N0YXJ0RXhwb3J0JykuZGlzYWJsZWQ9dHJ1ZTskKCdzdG9wRXhwb3J0JykuZGlzYWJsZWQ9ZmFsc2U7dHJ5e2NvbnN0IHI9YXdhaXQgYXBpKCcvYXBpL2V4cG9ydCcse21ldGhvZDonUE9TVCcsaGVhZGVyczp7J0NvbnRlbnQtVHlwZSc6J2FwcGxpY2F0aW9uL2pzb24nfSxib2R5OkpTT04uc3RyaW5naWZ5KHBheWxvYWQpfSk7Y3VycmVudEpvYj1yLmpvYklkfHxyLnRhc2tJZDtwb2xsKCk7dGltZXI9c2V0SW50ZXJ2YWwocG9sbCw1MDApfWNhdGNoKGUpe2FsZXJ0KGUubWVzc2FnZSk7JCgnc3RhcnRFeHBvcnQnKS5kaXNhYmxlZD1mYWxzZTskKCdzdG9wRXhwb3J0JykuZGlzYWJsZWQ9dHJ1ZX19JCgnc3RvcEV4cG9ydCcpLm9uY2xpY2s9YXN5bmMoKT0+e2lmKCFjdXJyZW50Sm9iKXJldHVybjskKCdzdG9wRXhwb3J0JykuZGlzYWJsZWQ9dHJ1ZTt0cnl7YXdhaXQgYXBpKCcvYXBpL2pvYnMvJytjdXJyZW50Sm9iKycvc3RvcCcse21ldGhvZDonUE9TVCd9KX1jYXRjaChlKXthbGVydChlLm1lc3NhZ2UpfX07YXN5bmMgZnVuY3Rpb24gcG9sbCgpe2lmKCFjdXJyZW50Sm9iKXJldHVybjt0cnl7Y29uc3Qgcj1hd2FpdCBhcGkoJy9hcGkvam9icy8nK2N1cnJlbnRKb2IpO2NvbnN0IGo9ci5qb2I7JCgncHJvZ3Jlc3MnKS52YWx1ZT1qLnByb2dyZXNzfHwwOyQoJ3N0YXR1c1RleHQnKS50ZXh0Q29udGVudD0oai5zdGF0dXN8fCcnKSsnICcrKGoucHJvZ3Jlc3NQZXJjZW50fHwoKGoucHJvZ3Jlc3N8fDApKyclJykpOyQoJ21lc3NhZ2UnKS50ZXh0Q29udGVudD1qLm1lc3NhZ2V8fCcnOyQoJ2xvZ3MnKS50ZXh0Q29udGVudD0oai5sb2dzfHxbXSkuam9pbignXG4nKTskKCdsb2dzJykuc2Nyb2xsVG9wPSQoJ2xvZ3MnKS5zY3JvbGxIZWlnaHQ7aWYoWydjb21wbGV0ZWQnLCdzdG9wcGVkJ10uaW5jbHVkZXMoai5zdGF0dXMpKXtjbGVhckludGVydmFsKHRpbWVyKTt0aW1lcj1udWxsOyQoJ3N0YXJ0RXhwb3J0JykuZGlzYWJsZWQ9ZmFsc2U7JCgnc3RvcEV4cG9ydCcpLmRpc2FibGVkPXRydWU7Y29uc3QgcGF0aHM9KChqLnJlc3VsdCYmai5yZXN1bHQucGF0aHMpfHxbXSkubWFwKHA9PmA8bGk+PGNvZGU+JHtlc2NhcGVIdG1sKHApfTwvY29kZT48L2xpPmApLmpvaW4oJycpOyQoJ3Jlc3VsdCcpLmlubmVySFRNTD1gPHA+PHN0cm9uZz4ke2ouc3RhdHVzPT09J3N0b3BwZWQnPyflt7Lkv53lrZjpg6jliIbnu5PmnpwnOiflrozmiJAnfTwvc3Ryb25nPjwvcD48cD7nm67lvZXvvJo8Y29kZT4ke2VzY2FwZUh0bWwoai5yZXN1bHQ/Lm91dHB1dERpcnx8JycpfTwvY29kZT48L3A+PHVsPiR7cGF0aHN9PC91bD5gO2xvYWRIaXN0b3J5KCkuY2F0Y2goKCk9Pnt9KX1lbHNlIGlmKGouc3RhdHVzPT09J2ZhaWxlZCcpe2NsZWFySW50ZXJ2YWwodGltZXIpO3RpbWVyPW51bGw7JCgnc3RhcnRFeHBvcnQnKS5kaXNhYmxlZD1mYWxzZTskKCdzdG9wRXhwb3J0JykuZGlzYWJsZWQ9dHJ1ZTskKCdyZXN1bHQnKS5pbm5lckhUTUw9YDxwPjxzdHJvbmc+5aSx6LSl77yaPC9zdHJvbmc+JHtlc2NhcGVIdG1sKGouZXJyb3J8fGoubWVzc2FnZXx8J3Vua25vd24nKX08L3A+YH19Y2F0Y2goZSl7JCgnbWVzc2FnZScpLnRleHRDb250ZW50PWUubWVzc2FnZX19ZnVuY3Rpb24gZXNjYXBlSHRtbChzKXtyZXR1cm4gU3RyaW5nKHM/PycnKS5yZXBsYWNlKC9bJjw+IiddL2csYz0+KHsnJic6JyZhbXA7JywnPCc6JyZsdDsnLCc+JzonJmd0OycsJyInOicmcXVvdDsnLCInIjonJiMwMzk7J31bY10pKX0KPC9zY3JpcHQ+PC9ib2R5PjwvaHRtbD4=', 'base64').toString('utf8');
 
 async function requestHandler(req, res) {
-  const urlObj = new URL(req.url, `http://127.0.0.1:${state.port || DEFAULT_PORT}`);
+  const urlObj = new URL(req.url, `http://${LISTEN_HOST}:${state.port || DEFAULT_PORT}`);
   if (urlObj.pathname.startsWith('/api/')) return handleApi(req, res, urlObj);
   if (urlObj.pathname === '/' || urlObj.pathname === '/index.html') return sendText(res, HTML);
   return sendJson(res, { error: 'not found' }, 404);
@@ -2040,7 +2500,7 @@ function listenOnPort(startPort) {
         if (err.code === 'EADDRINUSE' && port < startPort + 50) tryPort(port + 1);
         else reject(err);
       });
-      server.listen(port, '127.0.0.1', () => resolve({ server, port }));
+      server.listen(port, LISTEN_HOST, () => resolve({ server, port }));
     };
     tryPort(startPort);
   });
@@ -2048,7 +2508,7 @@ function listenOnPort(startPort) {
 
 function openWebUi() {
   if (!state.port) return;
-  electron.shell.openExternal(`http://127.0.0.1:${state.port}/`);
+  electron.shell.openExternal(`http://${LISTEN_HOST}:${state.port}/`);
 }
 
 
@@ -2059,9 +2519,9 @@ function setupPluginIpcHandlers() {
   electron.ipcMain.handle('qq_export_open_web', async () => {
     if (!state.started || !state.port) await start();
     openWebUi();
-    return { ok: true, url: `http://127.0.0.1:${state.port}/` };
+    return { ok: true, url: `http://${LISTEN_HOST}:${state.port}/` };
   });
-  electron.ipcMain.handle('qq_export_status', async () => ({ ok: true, port: state.port, url: state.port ? `http://127.0.0.1:${state.port}/` : '' }));
+  electron.ipcMain.handle('qq_export_status', async () => ({ ok: true, host: LISTEN_HOST, port: state.port, url: state.port ? `http://${LISTEN_HOST}:${state.port}/` : '' }));
 }
 
 async function start() {
@@ -2073,7 +2533,7 @@ async function start() {
   const { server, port } = await listenOnPort(DEFAULT_PORT);
   state.server = server;
   state.port = port;
-  log(`web ui listening on http://127.0.0.1:${port}/`);
+  log(`web ui listening on http://${LISTEN_HOST}:${port}/`);
 }
 
 start().catch(err => log('startup failed', err?.stack || err));
